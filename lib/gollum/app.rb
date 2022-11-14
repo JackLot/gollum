@@ -31,6 +31,8 @@ require File.expand_path '../helpers', __FILE__
 Gollum::set_git_timeout(120)
 Gollum::set_git_max_filesize(190 * 10**6)
 
+Gollum::Filter::Code.language_handlers[/mermaid/] = Proc.new { |lang, code| "<div class=\"mermaid\">\n#{code}\n</div>" }
+
 # Run the frontend, based on Sinatra
 #
 # There are a number of wiki options that can be set for the frontend
@@ -103,16 +105,14 @@ module Precious
     end
 
     before do
-      settings.wiki_options[:allow_editing] = settings.wiki_options.fetch(:allow_editing, true)
-      @allow_editing = settings.wiki_options[:allow_editing]
+      @allow_editing = settings.wiki_options.fetch(:allow_editing, true)
       @critic_markup = settings.wiki_options[:critic_markup]
       @redirects_enabled = settings.wiki_options.fetch(:redirects_enabled, true)
       @per_page_uploads = settings.wiki_options[:per_page_uploads]
       @show_local_time = settings.wiki_options.fetch(:show_local_time, false)
       
       @wiki_title = settings.wiki_options.fetch(:title, 'Gollum Wiki')
-
-      forbid unless @allow_editing || request.request_method == 'GET'
+      @default_keybinding = settings.wiki_options.fetch(:default_keybinding, 'default')
 
       if settings.wiki_options[:template_dir]
         Precious::Views::Layout.extend Precious::Views::TemplateCascade
@@ -128,6 +128,8 @@ module Precious
       @js  = settings.wiki_options[:js]
       @mathjax_config = settings.wiki_options[:mathjax_config]
       @mathjax = settings.wiki_options[:mathjax]
+      @mermaid = settings.wiki_options[:mermaid]
+      Gollum::Filter::Code.language_handlers.delete(/mermaid/) unless @mermaid
 
       @use_static_assets = settings.wiki_options.fetch(:static, settings.environment != :development)
       @static_assets_path = settings.wiki_options.fetch(:static_assets_path, ::File.join(File.dirname(__FILE__), 'public/assets'))
@@ -143,6 +145,8 @@ module Precious
           config.manifest = Sprockets::Manifest.new(settings.sprockets, @static_assets_path)
         end
       end
+
+      forbid unless @allow_editing || request.request_method == 'GET'
     end
 
     get '/' do
@@ -241,22 +245,9 @@ module Precious
           tempfile = params[:file][:tempfile]
         end
         halt 500 unless tempfile.is_a? Tempfile
+        
+        dir = wiki.per_page_uploads ? find_per_page_upload_subdir(request.referer, request.host_with_port, wiki.base_path) : 'uploads'
 
-        if wiki.per_page_uploads
-          dir = request.referer.match(/^https?:\/\/#{request.host_with_port}\/(.*)/)[1]          
-          # remove base path if it is set
-          dir.sub!(/^#{wiki.base_path}/, '') if wiki.base_path
-          # remove base_url and gollum/* subpath if necessary
-          dir.sub!(/^\/gollum\/[-\w]+\//, '')
-          # remove file extension
-          dir.sub!(/#{::File.extname(dir)}$/, '')
-          # revert escaped whitespaces
-          dir.gsub!(/%20/, ' ')
-          dir = ::File.join('uploads', dir)
-        else
-          # store all uploads together
-          dir = 'uploads'
-        end
         halt 500 if dir.include?('..')
         halt 500 unless Pathname(dir).relative?
 
@@ -274,7 +265,7 @@ module Precious
           options.merge! author
         end
 
-        normalize = Gollum::Page.valid_extension?(fullname)
+        options[:normalize] = Gollum::Page.valid_extension?(fullname)
 
         begin
           wiki.write_file(reponame, contents, options)
@@ -369,7 +360,7 @@ module Precious
         @name = wikip.name
         @ext  = wikip.ext
         @path = wikip.path
-        @template_page = load_template(@path) if settings.wiki_options[:template_page]
+        @template_page = load_template(wikip, @path) if settings.wiki_options[:template_page]
         @allow_uploads = wikip.wiki.allow_uploads
         @upload_dest   = find_upload_dest(wikip.fullpath)
 
@@ -661,9 +652,9 @@ module Precious
       end
     end
 
-    def load_template(path)
+    def load_template(wiki_page, path)
       template_page = wiki_page(::File.join(path, '_Template')).page || wiki_page('/_Template').page
-      template_page ? Gollum::TemplateFilter.apply_filters(template_page.text_data) : nil
+      template_page ? Gollum::TemplateFilter.apply_filters(wiki_page, template_page.text_data) : nil
     end
 
     def update_wiki_page(wiki, page, content, commit, name = nil, format = nil)
